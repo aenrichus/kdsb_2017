@@ -2,7 +2,9 @@ import numpy as np
 import pandas as pd
 import dicom
 import os
+import sqlite3
 import scipy.ndimage
+from collections import OrderedDict
 
 
 image_dir = 'stage1/'
@@ -88,12 +90,23 @@ def zero_center(image):  # <<<<<<<<<<<<<<<<<<<<<<<< Do we want to do this? If we
     return image
 
 
-# code for testing the above
+# load all of the patients
+patient_scans = OrderedDict()
+patient_pixels = OrderedDict()
+patient_resampled = OrderedDict()
+patient_spacing = OrderedDict()
+
+for i in patients:
+    patient_scans[i] = load_scan(image_dir + i)
+    patient_pixels[i] = get_pixels_hu(patient_scans[i])
+    patient_resampled[i], patient_spacing[i] = resample(patient_pixels[i], patient_scans[i])
+
+# code used for testing the above
 first_patient = load_scan(image_dir + patients[0])  # returns raw dicom data for each slice
 first_patient_pixels = get_pixels_hu(first_patient)  # returns arrays with HU values
 first_patient_pixels.shape  # 145 slices that are 512x512 squares
 
-first_patient_resampled, spacing = resample(first_patient_pixels, first_patient, [1,1,1])
+first_patient_resampled, spacing = resample(first_patient_pixels, first_patient)
 first_patient_resampled.shape
 
 first_patient_normalized = normalize(first_patient_resampled)

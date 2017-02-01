@@ -2,7 +2,6 @@ import numpy as np
 import pandas as pd
 import dicom
 import os
-import sqlite3
 import scipy.ndimage
 from collections import OrderedDict
 

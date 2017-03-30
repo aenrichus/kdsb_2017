@@ -1,54 +1,33 @@
 import tensorflow as tf
 import pandas as pd
+import numpy as np
 import random
 import time
+import os
 
 start_time = time.time()  # used to calculate elapsed time
 
 
 flags = tf.app.flags
 FLAGS = flags.FLAGS
-flags.DEFINE_integer('max_steps', 100000, 'Number of steps to run trainer.')
-flags.DEFINE_float('learning_rate', 1e-4, 'Initial learning rate.')
-flags.DEFINE_string('data_dir', 'data', 'Directory for storing data')
-flags.DEFINE_string('summaries_dir', 'logs', 'Summaries directory')
+flags.DEFINE_integer('max_steps', 1000, 'Number of steps to run trainer.')
+flags.DEFINE_integer('pad_max', 400, 'Padding should be 400x400x400.')
+flags.DEFINE_string('image_dir', 'stage1_processed/', 'Image directory')
+flags.DEFINE_string('logs_dir', 'logs', 'Logs directory')
+
+patients = os.listdir(FLAGS.image_dir)
 
 
-def train_model():
-    """
-    This function contains the entire model. Inelegant, but it gets the job done.
+def get_accuracy(predictions, labels):
+    accuracy = tf.reduce_mean(tf.cast(tf.equal(tf.argmax(predictions, 1), tf.argmax(labels, 1)), tf.float32))
+    return accuracy
 
-    :return: None
-    """
-    print("Reading files...")
-    train_data = pd.read_table("patterns/6ktraining.dict", header=None)
-    test_data = pd.read_table("patterns/strain.txt", header=None)
-    print("Read files.")
 
-    print("Loading images...")
-    train_images = load_images(train_data[0])
-    test_images = load_images(test_data[0])
-    print("Loaded", len(train_images) + len(test_images), "images.")
-
-    print("Loading labels...")
-    op_words = pd.read_table("patterns/op_words.txt", header=None)
-    op_words_labs = op_char(op_words.ix[:, 2])
-    op_train_labs = op_words_labs[:5870, :]  # np is not inclusive of final, right?
-    op_test_labs = op_words_labs[5870:6030, :]
-    print("Loaded", len(op_words_labs), "labels.")
-
-    print("Instancing classes...")
-    train = CnnData(train_images, op_train_labs)
-    test = CnnData(test_images, op_test_labs)
-    print("Instanced classes.")
-
-    # Start the interactive session
-    sess = tf.InteractiveSession()
-
+def run_model():
     # input placeholders
     x = tf.placeholder(tf.float32, [None, 128 * 32], name='x-input')
-    x_image_shaped = tf.reshape(x, [-1, 32, 128, 1])
-    y_ = tf.placeholder(tf.float32, [None, 38 * 10], name='y-input')
+    x_image_shaped = tf.reshape(x, [-1, 400, 400, 400, 1])
+    y_ = tf.placeholder(tf.float32, [None, 1], name='y-input')
 
     def weight_variable(shape):
         """
@@ -73,7 +52,7 @@ def train_model():
 
     def conv_layer(input_tensor, input_kernel, input_dim, output_dim):
         """
-        Makes a convolutional layer: It does a convolution, bias add, uses relu, and uses max-pooling.
+        Makes a convolutional layer: It does a convolution, bias add, uses ReLU.
 
         :param input_tensor: the input to this layer
         :param input_kernel: number of dimensions (3)
@@ -81,11 +60,18 @@ def train_model():
         :param output_dim: number of feature maps in the output
         :return: output activations
         """
-        weights = weight_variable([input_kernel, input_kernel, input_dim, output_dim])
+        weights = weight_variable([input_kernel, input_kernel, input_kernel, input_dim, output_dim])
         biases = bias_variable([output_dim])
-        preactivate = tf.nn.conv2d(input_tensor, weights, strides=[1, 1, 1, 1], padding='SAME') + biases
+        preactivate = tf.add(
+            tf.nn.conv3d(input_tensor, weights, strides=[1, 1, 1, 1, 1], padding='SAME'), biases)
         activations = tf.nn.relu(preactivate)
-        pooled = tf.nn.max_pool(activations, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1], padding='SAME')
+        return activations
+
+    def pool_layer(input_tensor, input_kernel = 2):
+        pooled = tf.nn.max_pool3d(input_tensor,
+                                  ksize=[1, input_kernel, input_kernel, input_kernel, 1],
+                                  strides=[1, 1, 1, 1, 1],
+                                  padding='SAME')
         return pooled
 
     def nn_layer(input_tensor, input_dim, output_dim, act=tf.nn.relu):
@@ -100,75 +86,84 @@ def train_model():
         """
         weights = weight_variable([input_dim, output_dim])
         biases = bias_variable([output_dim])
-        preactivate = tf.matmul(input_tensor, weights) + biases
+        preactivate = tf.add(tf.matmul(input_tensor, weights), biases)
         activations = act(preactivate)
         return activations
 
-    # Model structure: input -> 3 convolutional layers => fully connected layer => output
+    # Model structure: AlexNet in 3D
     conv1 = conv_layer(x_image_shaped, 3, 1, 32)
-    conv2 = conv_layer(conv1, 3, 32, 64)
+    pool1 = pool_layer(conv1)
+    conv2 = conv_layer(pool1, 3, 32, 64)
     conv3 = conv_layer(conv2, 3, 64, 128)
-    conv3_flat = tf.reshape(conv3, [-1, 16 * 4 * 128])
-    fc = nn_layer(conv3_flat, 16*4*128, 500)
-    y = nn_layer(fc, 500, 38*10, act=tf.nn.softmax)
+    conv4 = conv_layer(conv3, 3, 128, 256)
+    conv5 = conv_layer(conv4, 3, 256, 512)
+    pool2 = pool_layer(conv5)
+    pool2_flat = tf.reshape(pool2, [-1, 100 * 100 * 100 * 512])
+    fc1 = nn_layer(pool2_flat, 100 * 100 * 100 * 512, 4096, act=tf.nn.tanh)
+    dropout1 = tf.nn.dropout(fc1, 0.5)
+    fc2 = nn_layer(dropout1, 4096, 4096, act=tf.nn.tanh)
+    dropout2 = tf.nn.dropout(fc2, 0.5)
+    y = nn_layer(dropout2, 4096, 1, act=tf.nn.sigmoid)
 
     # Cost function: cross entropy between prediction and log output activations
-    diff = y_ * tf.log(y)
-    cross_entropy = -tf.reduce_sum(diff)
+    cross_entropy = tf.reduce_mean(-tf.reduce_sum(y_ * tf.log(y)))
 
     # Training using the Adam optimizer to minimize the overall cross entropy
-    train_step = tf.train.AdamOptimizer(FLAGS.learning_rate).minimize(cross_entropy)
+    train_step = tf.train.MomentumOptimizer(0.0014, 0.9).minimize(cross_entropy)
 
-    # Evaluate the accuracy of predictions
-    y0, y1, y2, y3, y4, y5, y6, y7, y8, y9 = tf.split(1, 10, y)  # reshape output to number of output locations
-    y_0, y_1, y_2, y_3, y_4, y_5, y_6, y_7, y_8, y_9 = tf.split(1, 10, y_)
+    # TODO calculate accuracy of predictions
+    accuracy = 0
 
-    correct_0 = tf.equal(tf.argmax(y0, 1), tf.argmax(y_0, 1))  # check if the most activated unit in y == y_
-    correct_1 = tf.equal(tf.argmax(y1, 1), tf.argmax(y_1, 1))
-    correct_2 = tf.equal(tf.argmax(y2, 1), tf.argmax(y_2, 1))
-    correct_3 = tf.equal(tf.argmax(y3, 1), tf.argmax(y_3, 1))
-    correct_4 = tf.equal(tf.argmax(y4, 1), tf.argmax(y_4, 1))
-    correct_5 = tf.equal(tf.argmax(y5, 1), tf.argmax(y_5, 1))
-    correct_6 = tf.equal(tf.argmax(y6, 1), tf.argmax(y_6, 1))
-    correct_7 = tf.equal(tf.argmax(y7, 1), tf.argmax(y_7, 1))
-    correct_8 = tf.equal(tf.argmax(y8, 1), tf.argmax(y_8, 1))
-    correct_9 = tf.equal(tf.argmax(y9, 1), tf.argmax(y_9, 1))
-    corr_01 = tf.logical_and(correct_0, correct_1)
-    corr_23 = tf.logical_and(correct_2, correct_3)
-    corr_45 = tf.logical_and(correct_4, correct_5)
-    corr_67 = tf.logical_and(correct_6, correct_7)
-    corr_89 = tf.logical_and(correct_8, correct_9)
-    corr_0123 = tf.logical_and(corr_01, corr_23)
-    corr_4567 = tf.logical_and(corr_45, corr_67)
-    corr_0_7 = tf.logical_and(corr_0123, corr_4567)
-    correct_prediction = tf.logical_and(corr_0_7, corr_89)
+    with tf.Session() as sess:
 
-    accuracy = tf.reduce_mean(tf.cast(correct_prediction, tf.float32))  # convert to float and take the mean
+        print("Beginning training...")
+        # Start tf session by initializing variables
+        saver = tf.train.Saver()
 
-    # Start tf session by initializing variables
-    tf.initialize_all_variables().run()
-    saver = tf.train.Saver()
+        # TODO load the labels file
+        # TODO divide into training and testing sets
+        # TODO consider adding padding to the preprocessing
+        # TODO check the maximum image size
 
-    print("Beginning training...")
-    for i in range(FLAGS.max_steps+1):
-        if i % 100 == 0:
-            print('STEP\t%s\tElapsed time\t%s minutes.' % (i, round((time.time() - start_time) / 60, 2)))
+        for i in range(FLAGS.max_steps+1):
 
-            if i % 1000 == 0:  # Test on the training set
-                ce, acc = sess.run([cross_entropy, accuracy], feed_dict={x: train.images, y_: train.labels})
-                print('Train\tACC:\t%s\tERR:\t%s' % (acc, ce))
+            # select image
+            current_image = np.random.choice(patients)
 
-            # Test on Strain items (not in training set)
-            ce, acc = sess.run([cross_entropy, accuracy], feed_dict={x: test.images, y_: test.labels})
-            print('Test\tACC:\t%s\tERR:\t%s' % (acc, ce))
+            # load the image
+            current_subject = np.load(FLAGS.image_dir + current_image)
 
-        else:  # Chose random input for training and run training
-            batch_images, batch_labels = zip(*random.sample(list(zip(train.images, train.labels)), 10))
-            sess.run(train_step, feed_dict={x: batch_images, y_: batch_labels})
+            # get the image dimensions
+            current_shape = np.shape(current_subject)
+            x_dim = current_shape[0]
+            y_dim = current_shape[1]
+            z_dim = current_shape[2]
+
+            # determine dimensions for padding
+            paddings = [[round((FLAGS.pad_max - x_dim)/2), round((FLAGS.pad_max - x_dim)/2)],
+                        [round((FLAGS.pad_max - y_dim)/2), round((FLAGS.pad_max - y_dim)/2)],
+                        [round((FLAGS.pad_max - z_dim)/2), round((FLAGS.pad_max - z_dim)/2)]]
+
+            if x_dim % 2 == 1: paddings[0][0] -= 1
+            if y_dim % 2 == 1: paddings[1][0] -= 1
+            if z_dim % 2 == 1: paddings[2][0] -= 1
+
+            # resize (pad) the image
+            padded_subject = np.pad(current_subject, paddings)
+
+            # TODO print test set cross entropy and accuracy
+            if i % 100 == 0:
+                ce, acc = sess.run([cross_entropy, accuracy], feed_dict={x: test_images, y_: test_labels})
+                elapsed_time = round((time.time() - start_time) / 60, 2)
+                print('STEP\t%s\tacc:\t%s\tce:\t%s\ttime\t%s minutes.' % (i, acc, ce, elapsed_time))
+
+            # TODO train on padded image
+            train_step.run(train_step, feed_dict={x: train_image, y_: train_label})
+
     print("Training complete.")
 
     # Save model state after training
-    save_path = saver.save(sess, "savegame/model_complete2.ckpt")
+    save_path = saver.save(sess, "logs/model_complete.ckpt")
     print("Model saved in file: %s" % save_path)
 
 
@@ -176,7 +171,7 @@ def main(_):
     if tf.gfile.Exists(FLAGS.summaries_dir):
         tf.gfile.DeleteRecursively(FLAGS.summaries_dir)
     tf.gfile.MakeDirs(FLAGS.summaries_dir)
-    train_model()
+    run_model()
     print("Game over?")
 
 if __name__ == '__main__':

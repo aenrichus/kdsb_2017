@@ -1,25 +1,21 @@
 import numpy as np
-import pandas as pd
 import dicom
 import os
 import scipy.ndimage
-from collections import OrderedDict
 
 
 image_dir = 'stage1/'
+MIN_BOUND = -1000.0
+MAX_BOUND = 400.0
+PIXEL_MEAN = 0.25
+
 patients = os.listdir(image_dir)
 patients.sort()
 
 
 def load_scan(path):
-    """
-    This function loads the slices of a scan for a patient.
-
-    :param path:
-    :return:
-    """
     slices = [dicom.read_file(path + '/' + s) for s in os.listdir(path)]
-    slices.sort(key=lambda x: int(x.InstanceNumber))
+    slices.sort(key=lambda x: int(x.ImagePositionPatient[2]))
     try:
         slice_thickness = np.abs(slices[0].ImagePositionPatient[2] - slices[1].ImagePositionPatient[2])
     except:
@@ -31,33 +27,35 @@ def load_scan(path):
     return slices
 
 
-def get_pixels_hu(scans):
-    image = np.stack([s.pixel_array for s in scans])
+def get_pixels_hu(slices):
+    image = np.stack([s.pixel_array for s in slices])
     # Convert to int16 (from sometimes int16),
     # should be possible as values should always be low enough (<32k)
     image = image.astype(np.int16)
 
     # Set outside-of-scan pixels to 0
-    # The intercept is usually -1024, so air is approximately 0
-    image[image == -2000] = 0
+    # The intercept is usually -1024, so air is approximately 0 <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+    outside_image = image.min()
+    image[image == outside_image] = 0
 
     # Convert to Hounsfield units (HU)
-    intercept = scans[0].RescaleIntercept
-    slope = scans[0].RescaleSlope
+    for slice_number in range(len(slices)):
 
-    if slope != 1:
-        image = slope * image.astype(np.float64)
-        image = image.astype(np.int16)
+        intercept = slices[slice_number].RescaleIntercept
+        slope = slices[slice_number].RescaleSlope
 
-    image += np.int16(intercept)
+        if slope != 1:
+            image[slice_number] = slope * image[slice_number].astype(np.float64)
+            image[slice_number] = image[slice_number].astype(np.int16)
+
+        image[slice_number] += np.int16(intercept)
 
     return np.array(image, dtype=np.int16)
 
 
-def resample(image, scan, new_spacing=[1, 1, 1]):  # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<< COULD THIS BE IMPROVED?
+def resample(image, scan, new_spacing=[1, 1, 1]):
     # Determine current pixel spacing
-    spacing = map(float, ([scan[0].SliceThickness] + scan[0].PixelSpacing))
-    spacing = np.array(list(spacing))
+    spacing = np.array([scan[0].SliceThickness] + scan[0].PixelSpacing, dtype=np.float32)
 
     resize_factor = spacing / new_spacing
     new_real_shape = image.shape * resize_factor
@@ -65,48 +63,46 @@ def resample(image, scan, new_spacing=[1, 1, 1]):  # <<<<<<<<<<<<<<<<<<<<<<<<<<<
     real_resize_factor = new_shape / image.shape
     new_spacing = spacing / real_resize_factor
 
-    image = scipy.ndimage.interpolation.zoom(image, real_resize_factor)
+    image = scipy.ndimage.interpolation.zoom(image, real_resize_factor, mode='nearest')
 
     return image, new_spacing
 
 
-MIN_BOUND = -1000.0
-MAX_BOUND = 400.0
-
-
-def normalize(image):  # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<< Is there no numpy function for this already?
+def normalize(image):
     image = (image - MIN_BOUND) / (MAX_BOUND - MIN_BOUND)
     image[image > 1] = 1.
     image[image < 0] = 0.
     return image
 
 
-PIXEL_MEAN = 0.25
-
-
-def zero_center(image):  # <<<<<<<<<<<<<<<<<<<<<<<< Do we want to do this? If we do, we should calculate the real mean.
+def zero_center(image):
     image = image - PIXEL_MEAN
     return image
 
+# pre-process all patients (no padding here, to save space)
+for i in patients:
+    patient_scans = load_scan(image_dir + i)
+    patient_pixels = get_pixels_hu(patient_scans)
+    patient_resampled, patient_spacing = resample(patient_pixels, patient_scans)
+    patient_normalized = normalize(patient_resampled)
+    patient_zeroed = zero_center(patient_normalized)
 
-# load all of the patients
-patient_scans = OrderedDict()
-patient_pixels = OrderedDict()
-patient_resampled = OrderedDict()
-patient_spacing = OrderedDict()
+    patient_save = 'stage1_processed/' + str(i) + '.npy'
+    np.save(patient_save, patient_zeroed)
+    print("Processed patient " + str(i))
+
+# get padding dimensions
+x_val = 0
+y_val = 0
+z_val = 0
 
 for i in patients:
-    patient_scans[i] = load_scan(image_dir + i)
-    patient_pixels[i] = get_pixels_hu(patient_scans[i])
-    patient_resampled[i], patient_spacing[i] = resample(patient_pixels[i], patient_scans[i])
+    pat_npy = np.load('stage1_processed/' + i + '.npy')
+    pat_shape = pat_npy.shape
+    x_val = max(x_val, pat_shape[0])
+    y_val = max(y_val, pat_shape[1])
+    z_val = max(z_val, pat_shape[2])
 
-# code used for testing the above
-first_patient = load_scan(image_dir + patients[0])  # returns raw dicom data for each slice
-first_patient_pixels = get_pixels_hu(first_patient)  # returns arrays with HU values
-first_patient_pixels.shape  # 145 slices that are 512x512 squares
-
-first_patient_resampled, spacing = resample(first_patient_pixels, first_patient)
-first_patient_resampled.shape
-
-first_patient_normalized = normalize(first_patient_resampled)
-first_patient_zeroed = zero_center(first_patient_normalized)
+print(x_val)
+print(y_val)
+print(z_val)
